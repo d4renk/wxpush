@@ -339,15 +339,13 @@ export default {
       const template_id = params.template_id || env.WX_TEMPLATE_ID;
       const base_url = params.base_url || env.WX_BASE_URL;
 
-      if (!appid || !secret || !useridStr || !template_id) {
-          const responseBody = { msg: 'Missing required environment variables: WX_APPID, WX_SECRET, WX_USERID, WX_TEMPLATE_ID' };
+      if (!appid || !secret || !template_id) {
+          const responseBody = { msg: 'Missing required environment variables: WX_APPID, WX_SECRET, WX_TEMPLATE_ID' };
           return new Response(JSON.stringify(responseBody), {
             status: 500,
             headers: { 'Content-Type': 'application/json; charset=utf-8' },
           });
       }
-
-      const user_list = useridStr.split('|').map(uid => uid.trim()).filter(Boolean);
 
       try {
         const accessToken = await getStableToken(appid, secret);
@@ -359,14 +357,30 @@ export default {
           });
         }
 
-        const results = await Promise.all(user_list.map(userid =>
+        const user_list = useridStr
+          ? useridStr.split('|').map(uid => uid.trim()).filter(Boolean)
+          : await getFollowerOpenIds(accessToken);
+
+        if (user_list.length === 0) {
+          const responseBody = { msg: 'No target users found. Configure WX_USERID or ensure the service account has followers.' };
+          return new Response(JSON.stringify(responseBody), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          });
+        }
+
+        const results = await sendMessagesInBatches(user_list, 20, (userid) =>
           sendMessage(accessToken, userid, template_id, base_url, title, content)
-        ));
+        );
 
         const successfulMessages = results.filter(r => r.errmsg === 'ok');
+        const failedMessages = results.length - successfulMessages.length;
 
         if (successfulMessages.length > 0) {
-          const responseBody = { msg: `Successfully sent messages to ${successfulMessages.length} user(s). First response: ok` };
+          const targetScope = useridStr ? 'specified user(s)' : 'current followers';
+          const responseBody = {
+            msg: `Successfully sent messages to ${successfulMessages.length} ${targetScope}. Failed: ${failedMessages}.`,
+          };
           return new Response(JSON.stringify(responseBody), {
             status: 200,
             headers: { 'Content-Type': 'application/json; charset=utf-8' },
@@ -528,6 +542,47 @@ async function getStableToken(appid, secret) {
   });
   const data = await response.json();
   return data.access_token;
+}
+
+async function getFollowerOpenIds(accessToken) {
+  const openIds = [];
+  let nextOpenId = '';
+
+  do {
+    const url = new URL('https://api.weixin.qq.com/cgi-bin/user/get');
+    url.searchParams.set('access_token', accessToken);
+    if (nextOpenId) {
+      url.searchParams.set('next_openid', nextOpenId);
+    }
+
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' }
+    });
+    const data = await response.json();
+
+    if (data.errcode) {
+      throw new Error(`Failed to get follower list: ${data.errmsg || data.errcode}`);
+    }
+
+    const pageOpenIds = Array.isArray(data?.data?.openid) ? data.data.openid : [];
+    openIds.push(...pageOpenIds);
+    nextOpenId = data.next_openid || '';
+  } while (nextOpenId);
+
+  return openIds;
+}
+
+async function sendMessagesInBatches(userIds, batchSize, sendFn) {
+  const results = [];
+
+  for (let i = 0; i < userIds.length; i += batchSize) {
+    const batch = userIds.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(sendFn));
+    results.push(...batchResults);
+  }
+
+  return results;
 }
 
 async function sendMessage(accessToken, userid, template_id, base_url, title, content) {
